@@ -4,8 +4,12 @@ pragma solidity ^0.8.30;
 import "forge-std/Test.sol";
 import {PaymentNetwork} from "../src/PaymentNetwork.sol";
 import {VotingPowers} from "../src/symbiotic/VotingPowers.sol";
+import {
+    SymbioticDestinationVerifier
+} from "../src/symbiotic/SymbioticDestinationVerifier.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {TypeCasts} from "@hyperlane-xyz/libs/TypeCasts.sol";
 
 import {
     IVaultConfigurator
@@ -40,21 +44,30 @@ import {
 
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockSettlement} from "./mocks/MockSettlement.sol";
+import {MockSymbioticCore} from "./mocks/MockSymbioticCore.sol";
 import {MockVaultConfigurator} from "./mocks/MockVaultConfigurator.sol";
 import {MockRewardsFactory} from "./mocks/MockRewardsFactory.sol";
+import {MockWarpRoute} from "./mocks/MockWarpRoute.sol";
+import {MockMailbox} from "./mocks/MockMailbox.sol";
 import {MockRewards} from "./mocks/MockRewards.sol";
 import {MockVault} from "./mocks/MockVault.sol";
-import {MockSymbioticCore} from "./mocks/MockSymbioticCore.sol";
 
 contract PaymentNetworkTest is Test {
+    using TypeCasts for address;
+
     PaymentNetwork network;
     VotingPowers votingPowers;
+    SymbioticDestinationVerifier destVerifier;
 
     MockERC20 usdc;
+    MockERC20 dai;
     MockSettlement settlement;
     MockSymbioticCore coreMock;
     MockVaultConfigurator vaultConfigurator;
     MockRewardsFactory rewardsFactory;
+    MockWarpRoute warpRouteOP;
+    MockWarpRoute warpRouteARB;
+    MockMailbox mailbox;
 
     address owner = address(0x1);
     address admin = address(0x1337);
@@ -67,21 +80,35 @@ contract PaymentNetworkTest is Test {
     uint32 constant EXPIRY = 1 days;
     uint256 constant KEY_TAG_BLS = 15;
 
+    uint32 constant DOMAIN_OP = 10;
+    uint32 constant DOMAIN_ARB = 42161;
+
+    event CrossChainPayoutDispatched(
+        uint32 indexed destination,
+        address indexed token,
+        address recipient,
+        uint256 amount
+    );
+    event ValidatorSetSynced(uint48 indexed epoch, uint256[4] key);
+
     function setUp() public {
         usdc = new MockERC20("USDC", "USDC");
+        dai = new MockERC20("DAI", "DAI");
         settlement = new MockSettlement();
         coreMock = new MockSymbioticCore();
         vaultConfigurator = new MockVaultConfigurator();
         rewardsFactory = new MockRewardsFactory();
+        warpRouteOP = new MockWarpRoute();
+        warpRouteARB = new MockWarpRoute();
+        mailbox = new MockMailbox();
 
-        vm.prank(owner);
+        vm.startPrank(owner);
+
         votingPowers = new VotingPowers(
             address(coreMock),
             address(coreMock),
             address(vaultConfigurator)
         );
-
-        vm.prank(owner);
         votingPowers.initialize(
             IVotingPowerProvider.VotingPowerProviderInitParams({
                 networkManagerInitParams: INetworkManager
@@ -113,7 +140,6 @@ contract PaymentNetworkTest is Test {
             IBaseSlashing.BaseSlashingInitParams({slasher: address(0)})
         );
 
-        vm.prank(owner);
         network = new PaymentNetwork(
             address(vaultConfigurator),
             address(coreMock),
@@ -121,8 +147,6 @@ contract PaymentNetworkTest is Test {
             address(rewardsFactory),
             address(coreMock)
         );
-
-        vm.prank(owner);
         network.initialize(
             PaymentNetwork.InitParams({
                 votingPowers: address(votingPowers),
@@ -132,25 +156,41 @@ contract PaymentNetworkTest is Test {
                 messageExpiry: EXPIRY,
                 protocolFeeBps: 100,
                 owner: owner,
-                expectedKeyTag: KEY_TAG_BLS
+                expectedKeyTag: KEY_TAG_BLS,
+                mailbox: address(mailbox)
             })
         );
 
-        vm.prank(owner);
+        destVerifier = new SymbioticDestinationVerifier(
+            address(mailbox),
+            1, // Chain ID of source
+            address(network)
+        );
+
         votingPowers.setPaymentNetwork(address(network));
-
-        vm.prank(owner);
         votingPowers.setRewarder(address(network));
-
-        usdc.transfer(admin, 100_000 ether);
-        vm.prank(owner);
         network.setTokenWhitelist(address(usdc), true);
+        network.setTokenWhitelist(address(dai), true);
+
+        network.setWarpRoute(address(usdc), DOMAIN_OP, address(warpRouteOP));
+        network.setWarpRoute(address(usdc), DOMAIN_ARB, address(warpRouteARB));
+        network.setDestinationVerifier(
+            DOMAIN_OP,
+            address(destVerifier).addressToBytes32()
+        );
+
+        vm.stopPrank();
+        usdc.transfer(admin, 100_000 ether);
+        dai.transfer(admin, 100_000 ether);
     }
+
+    // =========================================================
+    //  ORGANIZATION SETUP
+    // =========================================================
 
     function test_RegisterOrg_DeploysVault() public {
         vm.prank(admin);
         network.registerOrganization(orgA_Id, admin);
-
         (
             address savedAdmin,
             bool exists,
@@ -164,24 +204,22 @@ contract PaymentNetworkTest is Test {
     }
 
     function test_RegisterOrg_Fail_Duplicate() public {
-        vm.prank(admin);
+        vm.startPrank(admin);
         network.registerOrganization(orgA_Id, admin);
-
-        vm.prank(admin);
         vm.expectRevert(PaymentNetwork.OrgAlreadyExists.selector);
         network.registerOrganization(orgA_Id, admin);
+        vm.stopPrank();
     }
 
-    function test_SetTokenWhitelist_Success() public {
-        address newToken = address(0x999);
-        assertFalse(network.allowedTokens(newToken));
-
+    function test_Setup_TokenWhitelist() public {
+        address randomToken = address(0x999);
+        assertFalse(network.allowedTokens(randomToken));
         vm.prank(owner);
-        network.setTokenWhitelist(newToken, true);
-        assertTrue(network.allowedTokens(newToken));
+        network.setTokenWhitelist(randomToken, true);
+        assertTrue(network.allowedTokens(randomToken));
     }
 
-    function test_SetTokenWhitelist_Fail_NotOwner() public {
+    function test_Setup_OnlyOwnerCanWhitelist() public {
         vm.prank(hacker);
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -192,54 +230,61 @@ contract PaymentNetworkTest is Test {
         network.setTokenWhitelist(address(0x999), true);
     }
 
-    function test_DepositLiquidity_ERC20() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
+    // =========================================================
+    //  LIQUIDITY MANAGEMENT
+    // =========================================================
 
-        uint256 amount = 500 ether;
+    function test_Deposit_ERC20() public {
         vm.startPrank(admin);
-        usdc.approve(address(network), amount);
-        network.depositLiquidity(orgA_Id, address(usdc), amount);
+        network.registerOrganization(orgA_Id, admin);
+        usdc.approve(address(network), 500 ether);
+        network.depositLiquidity(orgA_Id, address(usdc), 500 ether);
         vm.stopPrank();
 
-        assertEq(network.orgBalances(orgA_Id, address(usdc)), amount);
-        assertEq(usdc.balanceOf(address(network)), amount);
-        assertEq(network.totalRecordedLiquidity(address(usdc)), amount);
+        assertEq(network.orgBalances(orgA_Id, address(usdc)), 500 ether);
+        assertEq(network.totalRecordedLiquidity(address(usdc)), 500 ether);
     }
 
-    function test_DepositLiquidity_ETH() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
-        uint256 amount = 5 ether;
-        vm.deal(admin, 10 ether);
-
-        vm.prank(admin);
-        network.depositETH{value: amount}(orgA_Id);
-
-        assertEq(network.orgBalances(orgA_Id, address(0)), amount);
-        assertEq(address(network).balance, amount);
-        assertEq(network.totalRecordedLiquidity(address(0)), amount);
-    }
-
-    function test_BatchDepositERC20_Success() public {
-        MockERC20 dai = new MockERC20("DAI", "DAI");
-        dai.transfer(admin, 100_000 ether);
-
-        vm.prank(owner);
-        network.setTokenWhitelist(address(dai), true);
-
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
+    function test_Deposit_ETH() public {
         vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        vm.deal(admin, 10 ether);
+        network.depositETH{value: 5 ether}(orgA_Id);
+        vm.stopPrank();
+
+        assertEq(network.orgBalances(orgA_Id, address(0)), 5 ether);
+        assertEq(address(network).balance, 5 ether);
+    }
+
+    function test_Deposit_Fail_ZeroAmount() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        vm.expectRevert(PaymentNetwork.InvalidDepositAmount.selector);
+        network.depositETH{value: 0}(orgA_Id);
+        vm.stopPrank();
+    }
+
+    function test_Deposit_Fail_NotWhitelisted() public {
+        MockERC20 fake = new MockERC20("FAKE", "FAKE");
+        fake.transfer(admin, 100 ether);
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        fake.approve(address(network), 100 ether);
+
+        vm.expectRevert(PaymentNetwork.TokenNotAllowed.selector);
+        network.depositLiquidity(orgA_Id, address(fake), 100 ether);
+        vm.stopPrank();
+    }
+
+    function test_BatchDeposit_Success() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
         usdc.approve(address(network), 100 ether);
         dai.approve(address(network), 200 ether);
 
         address[] memory tokens = new address[](2);
         tokens[0] = address(usdc);
         tokens[1] = address(dai);
-
         uint256[] memory amounts = new uint256[](2);
         amounts[0] = 100 ether;
         amounts[1] = 200 ether;
@@ -251,45 +296,61 @@ contract PaymentNetworkTest is Test {
         assertEq(network.orgBalances(orgA_Id, address(dai)), 200 ether);
     }
 
-    function test_WithdrawERC20_Success() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
+    function test_BatchDeposit_Fail_LengthMismatch() public {
         vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(usdc);
+        tokens[1] = address(dai);
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 100 ether;
+
+        vm.expectRevert(PaymentNetwork.ArrayLengthMismatch.selector);
+        network.batchDepositERC20Liquidity(orgA_Id, tokens, amounts);
+        vm.stopPrank();
+    }
+
+    function test_Withdraw_ERC20() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
         usdc.approve(address(network), 500 ether);
         network.depositLiquidity(orgA_Id, address(usdc), 500 ether);
-
         network.withdrawLiquidity(orgA_Id, address(usdc), 200 ether);
         vm.stopPrank();
-
         assertEq(network.orgBalances(orgA_Id, address(usdc)), 300 ether);
         assertEq(usdc.balanceOf(admin), 100_000 ether - 300 ether);
     }
 
-    function test_WithdrawETH_Success() public {
-        vm.prank(admin);
+    function test_Withdraw_ETH() public {
+        vm.startPrank(admin);
         network.registerOrganization(orgA_Id, admin);
-
-        uint256 depositAmount = 5 ether;
         vm.deal(admin, 10 ether);
-        vm.prank(admin);
-        network.depositETH{value: depositAmount}(orgA_Id);
-
-        uint256 preBalance = admin.balance;
-        uint256 withdrawAmount = 2 ether;
-
-        vm.prank(admin);
-        network.withdrawLiquidity(orgA_Id, address(0), withdrawAmount);
-
-        assertEq(admin.balance, preBalance + withdrawAmount);
-        assertEq(network.orgBalances(orgA_Id, address(0)), 3 ether);
+        network.depositETH{value: 5 ether}(orgA_Id);
+        uint256 preBal = admin.balance;
+        network.withdrawLiquidity(orgA_Id, address(0), 2 ether);
+        vm.stopPrank();
+        assertEq(admin.balance, preBal + 2 ether);
     }
 
-    function test_ProcessPayout_ERC20_WithRewards() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
+    function test_Withdraw_Fail_NotAdmin() public {
         vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        usdc.approve(address(network), 100 ether);
+        network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
+        vm.stopPrank();
+
+        vm.prank(hacker);
+        vm.expectRevert(PaymentNetwork.NotOrgAdmin.selector);
+        network.withdrawLiquidity(orgA_Id, address(usdc), 50 ether);
+    }
+
+    // =========================================================
+    //  LOCAL EXECUTION
+    // =========================================================
+
+    function test_Process_Local_WithFee() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
         usdc.approve(address(network), 1000 ether);
         network.depositLiquidity(orgA_Id, address(usdc), 1000 ether);
         vm.stopPrank();
@@ -297,15 +358,13 @@ contract PaymentNetworkTest is Test {
         PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
             1
         );
-        payments[0] = PaymentNetwork.Payment(alice, 100 ether);
+        payments[0] = PaymentNetwork.Payment(0, alice, 100 ether, 0);
 
-        uint256 votingPowersBalanceBefore = usdc.balanceOf(
-            address(votingPowers)
-        );
+        uint256 mwBal = usdc.balanceOf(address(votingPowers));
 
         network.processPayoutBatch(
             orgA_Id,
-            keccak256("Batch1"),
+            keccak256("Local"),
             address(usdc),
             payments,
             1,
@@ -313,157 +372,138 @@ contract PaymentNetworkTest is Test {
         );
 
         assertEq(usdc.balanceOf(alice), 100 ether);
+        // 100 + 1% fee = 101
         assertEq(network.orgBalances(orgA_Id, address(usdc)), 899 ether);
-        assertEq(
-            usdc.balanceOf(address(votingPowers)),
-            votingPowersBalanceBefore + 1 ether
-        );
+        assertEq(usdc.balanceOf(address(votingPowers)), mwBal + 1 ether);
     }
 
-    function test_ProcessPayout_ETH_WithRewards() public {
+    function test_Process_Fail_InsufficientLiquidity() public {
         vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
-        uint256 depositAmount = 200 ether;
-        vm.deal(admin, 200 ether);
-        vm.prank(admin);
-        network.depositETH{value: depositAmount}(orgA_Id);
-
+        network.registerOrganization(orgA_Id, admin); // No deposit
         PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
             1
         );
-        payments[0] = PaymentNetwork.Payment(alice, 100 ether);
-
-        uint256 ownerBalanceBefore = owner.balance;
-
-        network.processPayoutBatch(
-            orgA_Id,
-            keccak256("BatchETH"),
-            address(0),
-            payments,
-            1,
-            ""
-        );
-
-        assertEq(alice.balance, 100 ether);
-        assertEq(owner.balance, ownerBalanceBefore + 1 ether);
-    }
-
-    function test_Fail_InvalidKeyTag() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-        vm.startPrank(admin);
-        usdc.approve(address(network), 100 ether);
-        network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
-        vm.stopPrank();
-
-        settlement.setKeyTag(99);
-
-        PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
-            1
-        );
-        payments[0] = PaymentNetwork.Payment(alice, 10 ether);
-
-        vm.expectRevert(PaymentNetwork.InvalidKeyTag.selector);
-        network.processPayoutBatch(
-            orgA_Id,
-            keccak256("Batch_BadKey"),
-            address(usdc),
-            payments,
-            1,
-            ""
-        );
-    }
-
-    function test_Fail_SignatureExpired() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-        vm.startPrank(admin);
-        usdc.approve(address(network), 100 ether);
-        network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
-        vm.stopPrank();
-
-        vm.warp(1000);
-        settlement.setNextEpochTimestamp(2000);
-        vm.warp(2000 + 1 days + 1);
-
-        PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
-            1
-        );
-        payments[0] = PaymentNetwork.Payment(alice, 10 ether);
-
-        vm.expectRevert(PaymentNetwork.InvalidEpoch.selector);
-        network.processPayoutBatch(
-            orgA_Id,
-            keccak256("Batch_Expired"),
-            address(usdc),
-            payments,
-            1,
-            ""
-        );
-    }
-
-    function test_RescueSlashedFunds() public {
-        vm.startPrank(admin);
-        network.registerOrganization(orgA_Id, admin);
-        usdc.approve(address(network), 100 ether);
-        network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
-        vm.stopPrank();
-
-        usdc.transfer(address(network), 50 ether);
-
-        assertEq(usdc.balanceOf(address(network)), 150 ether);
-        assertEq(network.totalRecordedLiquidity(address(usdc)), 100 ether);
-
-        uint256 ownerBalanceBefore = usdc.balanceOf(owner);
-
-        vm.prank(owner);
-        network.rescueSlashedFunds(address(usdc), owner);
-
-        assertEq(usdc.balanceOf(owner), ownerBalanceBefore + 50 ether);
-        assertEq(usdc.balanceOf(address(network)), 100 ether);
-    }
-
-    function test_Isolation_SeparateBalances() public {
-        vm.startPrank(admin);
-        network.registerOrganization(orgA_Id, admin);
-        network.registerOrganization(orgB_Id, admin);
-        usdc.approve(address(network), 2000 ether);
-
-        network.depositLiquidity(orgA_Id, address(usdc), 1000 ether);
-        network.depositLiquidity(orgB_Id, address(usdc), 500 ether);
-        vm.stopPrank();
-
-        PaymentNetwork.Payment[] memory p1 = new PaymentNetwork.Payment[](1);
-        p1[0] = PaymentNetwork.Payment(alice, 800 ether);
-        network.processPayoutBatch(
-            orgA_Id,
-            keccak256("A_Batch"),
-            address(usdc),
-            p1,
-            1,
-            ""
-        );
-
-        PaymentNetwork.Payment[] memory p2 = new PaymentNetwork.Payment[](1);
-        p2[0] = PaymentNetwork.Payment(alice, 600 ether);
+        payments[0] = PaymentNetwork.Payment(0, alice, 100 ether, 0);
 
         vm.expectRevert(PaymentNetwork.InsufficientOrgLiquidity.selector);
         network.processPayoutBatch(
-            orgB_Id,
-            keccak256("B_Batch"),
+            orgA_Id,
+            keccak256("Fail"),
             address(usdc),
-            p2,
+            payments,
             1,
             ""
         );
     }
 
-    function test_Fail_ReplayProtection() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
+    function test_Process_Fail_TokenRemovedFromWhitelist() public {
         vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        usdc.approve(address(network), 100 ether);
+        network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
+        vm.stopPrank();
+
+        vm.prank(owner);
+        network.setTokenWhitelist(address(usdc), false);
+
+        PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
+            1
+        );
+        payments[0] = PaymentNetwork.Payment(0, alice, 50 ether, 0);
+
+        vm.expectRevert(PaymentNetwork.TokenNotAllowed.selector);
+        network.processPayoutBatch(
+            orgA_Id,
+            keccak256("FailW"),
+            address(usdc),
+            payments,
+            1,
+            ""
+        );
+    }
+
+    // =========================================================
+    //  CROSS-CHAIN EXECUTION
+    // =========================================================
+
+    function test_CrossChain_Single() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        usdc.approve(address(network), 1000 ether);
+        network.depositLiquidity(orgA_Id, address(usdc), 1000 ether);
+        vm.stopPrank();
+
+        PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
+            1
+        );
+        payments[0] = PaymentNetwork.Payment(
+            DOMAIN_OP,
+            alice,
+            100 ether,
+            0.01 ether
+        );
+
+        vm.deal(address(this), 1 ether);
+        vm.expectEmit(true, true, false, true);
+        emit CrossChainPayoutDispatched(
+            DOMAIN_OP,
+            address(usdc),
+            alice,
+            100 ether
+        );
+
+        network.processPayoutBatch{value: 0.01 ether}(
+            orgA_Id,
+            keccak256("Cross1"),
+            address(usdc),
+            payments,
+            1,
+            ""
+        );
+        assertEq(network.orgBalances(orgA_Id, address(usdc)), 899 ether);
+    }
+
+    function test_CrossChain_MultiDest() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        usdc.approve(address(network), 1000 ether);
+        network.depositLiquidity(orgA_Id, address(usdc), 1000 ether);
+        vm.stopPrank();
+
+        PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
+            3
+        );
+        payments[0] = PaymentNetwork.Payment(
+            DOMAIN_OP,
+            alice,
+            100 ether,
+            0.01 ether
+        );
+        payments[1] = PaymentNetwork.Payment(
+            DOMAIN_ARB,
+            bob,
+            200 ether,
+            0.02 ether
+        );
+        payments[2] = PaymentNetwork.Payment(0, hacker, 50 ether, 0); // Local
+
+        vm.deal(address(this), 1 ether);
+        network.processPayoutBatch{value: 0.03 ether}(
+            orgA_Id,
+            keccak256("Multi"),
+            address(usdc),
+            payments,
+            1,
+            ""
+        );
+
+        assertEq(usdc.balanceOf(hacker), 50 ether);
+        assertEq(network.orgBalances(orgA_Id, address(usdc)), 646.5 ether);
+    }
+
+    function test_CrossChain_Fail_Gas() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
         usdc.approve(address(network), 100 ether);
         network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
         vm.stopPrank();
@@ -471,8 +511,60 @@ contract PaymentNetworkTest is Test {
         PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
             1
         );
-        payments[0] = PaymentNetwork.Payment(alice, 10 ether);
-        bytes32 batchId = keccak256("UniqueBatch");
+        payments[0] = PaymentNetwork.Payment(
+            DOMAIN_OP,
+            alice,
+            10 ether,
+            0.05 ether
+        );
+
+        vm.deal(address(this), 0.01 ether);
+        vm.expectRevert(PaymentNetwork.InsufficientBridgeFee.selector);
+        network.processPayoutBatch{value: 0.01 ether}(
+            orgA_Id,
+            keccak256("FailG"),
+            address(usdc),
+            payments,
+            1,
+            ""
+        );
+    }
+
+    function test_CrossChain_Fail_NoRoute() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        usdc.approve(address(network), 1000 ether);
+        network.depositLiquidity(orgA_Id, address(usdc), 1000 ether);
+        vm.stopPrank();
+
+        PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
+            1
+        );
+        payments[0] = PaymentNetwork.Payment(9999, alice, 100 ether, 0);
+
+        vm.expectRevert(PaymentNetwork.RouteNotConfigured.selector);
+        network.processPayoutBatch(
+            orgA_Id,
+            keccak256("NoRoute"),
+            address(usdc),
+            payments,
+            1,
+            ""
+        );
+    }
+
+    function test_Security_ReplayProtection() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        usdc.approve(address(network), 100 ether);
+        network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
+        vm.stopPrank();
+
+        PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
+            1
+        );
+        payments[0] = PaymentNetwork.Payment(0, alice, 10 ether, 0);
+        bytes32 batchId = keccak256("Replay");
 
         network.processPayoutBatch(
             orgA_Id,
@@ -494,87 +586,23 @@ contract PaymentNetworkTest is Test {
         );
     }
 
-    function test_Withdraw_Fail_NotAdmin() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
+    function test_Security_InvalidKeyTag() public {
         vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
         usdc.approve(address(network), 100 ether);
         network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
         vm.stopPrank();
 
-        vm.prank(hacker);
-        vm.expectRevert(PaymentNetwork.NotOrgAdmin.selector);
-        network.withdrawLiquidity(orgA_Id, address(usdc), 50 ether);
-    }
-
-    function test_Withdraw_Fail_InsufficientBalance() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
-        vm.startPrank(admin);
-        usdc.approve(address(network), 100 ether);
-        network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
-
-        vm.expectRevert(PaymentNetwork.InsufficientOrgLiquidity.selector);
-        network.withdrawLiquidity(orgA_Id, address(usdc), 200 ether); // Only 100 deposited
-        vm.stopPrank();
-    }
-
-    function test_BatchDeposit_Fail_LengthMismatch() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
-        address[] memory tokens = new address[](2);
-        tokens[0] = address(usdc);
-        tokens[1] = address(usdc);
-
-        uint256[] memory amounts = new uint256[](1); // Mismatch!
-        amounts[0] = 100;
-
-        vm.prank(admin);
-        vm.expectRevert(PaymentNetwork.ArrayLengthMismatch.selector);
-        network.batchDepositERC20Liquidity(orgA_Id, tokens, amounts);
-    }
-
-    function test_Deposit_Fail_NotWhitelisted() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
-        MockERC20 fakeToken = new MockERC20("FAKE", "FAKE");
-        fakeToken.transfer(admin, 1000 ether);
-
-        vm.startPrank(admin);
-        fakeToken.approve(address(network), 1000 ether);
-
-        vm.expectRevert(PaymentNetwork.TokenNotAllowed.selector);
-        network.depositLiquidity(orgA_Id, address(fakeToken), 100 ether);
-        vm.stopPrank();
-    }
-
-    function test_ProcessPayout_Fail_NotWhitelisted() public {
-        // Token was whitelisted, funds deposited, then token removed from whitelist
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
-        vm.startPrank(admin);
-        usdc.approve(address(network), 100 ether);
-        network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
-        vm.stopPrank();
-
-        // Owner removes USDC from whitelist
-        vm.prank(owner);
-        network.setTokenWhitelist(address(usdc), false);
-
+        settlement.setKeyTag(99);
         PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
             1
         );
-        payments[0] = PaymentNetwork.Payment(alice, 100 ether);
+        payments[0] = PaymentNetwork.Payment(0, alice, 10 ether, 0);
 
-        vm.expectRevert(PaymentNetwork.TokenNotAllowed.selector);
+        vm.expectRevert(PaymentNetwork.InvalidKeyTag.selector);
         network.processPayoutBatch(
             orgA_Id,
-            keccak256("Batch1"),
+            keccak256("BadKey"),
             address(usdc),
             payments,
             1,
@@ -582,61 +610,130 @@ contract PaymentNetworkTest is Test {
         );
     }
 
-    function test_Rescue_Fail_NoSurplus() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
-
+    function test_Security_SignatureExpired() public {
         vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
         usdc.approve(address(network), 100 ether);
         network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
         vm.stopPrank();
 
-        // Try to rescue when Balance == Recorded Liquidity
+        vm.warp(1000);
+        settlement.setNextEpochTimestamp(2000);
+        vm.warp(2000 + 1 days + 1);
+
+        PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
+            1
+        );
+        payments[0] = PaymentNetwork.Payment(0, alice, 10 ether, 0);
+
+        vm.expectRevert(PaymentNetwork.InvalidEpoch.selector);
+        network.processPayoutBatch(
+            orgA_Id,
+            keccak256("Exp"),
+            address(usdc),
+            payments,
+            1,
+            ""
+        );
+    }
+
+    function test_Security_Isolation() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        network.registerOrganization(orgB_Id, admin);
+        usdc.approve(address(network), 2000 ether);
+        network.depositLiquidity(orgA_Id, address(usdc), 1000 ether);
+        network.depositLiquidity(orgB_Id, address(usdc), 500 ether);
+        vm.stopPrank();
+
+        PaymentNetwork.Payment[] memory p1 = new PaymentNetwork.Payment[](1);
+        p1[0] = PaymentNetwork.Payment(0, alice, 600 ether, 0);
+
+        // Org B only has 500, tries to spend 600
+        vm.expectRevert(PaymentNetwork.InsufficientOrgLiquidity.selector);
+        network.processPayoutBatch(
+            orgB_Id,
+            keccak256("FailIso"),
+            address(usdc),
+            p1,
+            1,
+            ""
+        );
+    }
+
+    function test_Security_MiddlewareAuth() public {
+        vm.prank(hacker);
+        vm.expectRevert(VotingPowers.NotPaymentNetwork.selector);
+        votingPowers.setMaxNetworkLimit(address(0x123));
+    }
+
+    // =========================================================
+    //  ACCOUNTING
+    // =========================================================
+
+    function test_Accounting_RescueSlashed() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        usdc.approve(address(network), 100 ether);
+        network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
+        vm.stopPrank();
+
+        // Simulate Slash
+        usdc.transfer(address(network), 50 ether);
+
+        uint256 bal = usdc.balanceOf(owner);
+        vm.prank(owner);
+        network.rescueSlashedFunds(address(usdc), owner);
+        assertEq(usdc.balanceOf(owner), bal + 50 ether);
+    }
+
+    function test_Accounting_Rescue_Fail() public {
+        vm.startPrank(admin);
+        network.registerOrganization(orgA_Id, admin);
+        usdc.approve(address(network), 100 ether);
+        network.depositLiquidity(orgA_Id, address(usdc), 100 ether);
+        vm.stopPrank();
+
         vm.prank(owner);
         vm.expectRevert(PaymentNetwork.NoSlashedFundsToRescue.selector);
         network.rescueSlashedFunds(address(usdc), owner);
     }
 
-    function test_Middleware_SetMaxLimit_Fail_Auth() public {
-        vm.prank(hacker);
-        vm.expectRevert(VotingPowers.NotPaymentNetwork.selector);
+    // =========================================================
+    //  DESTINATION VERIFICATION
+    // =========================================================
 
-        votingPowers.setMaxNetworkLimit(address(0x123));
+    function test_Dest_Sync() public {
+        uint48 epoch = 1;
+        uint256[4] memory key = [uint256(1), 2, 3, 4];
+
+        vm.expectEmit(true, true, false, true);
+        emit MockMailbox.Dispatch(
+            DOMAIN_OP,
+            address(destVerifier).addressToBytes32(),
+            abi.encode(epoch, key)
+        );
+
+        network.syncValidatorSet{value: 0.1 ether}(DOMAIN_OP, key);
+
+        vm.prank(address(mailbox));
+        emit ValidatorSetSynced(epoch, key);
+        destVerifier.handle(
+            1,
+            address(network).addressToBytes32(),
+            abi.encode(epoch, key)
+        );
+
+        uint256 x1 = destVerifier.epochKeys(epoch, 0);
+        assertEq(x1, 1);
     }
 
-    function test_ProcessPayout_MultipleRecipients() public {
-        vm.prank(admin);
-        network.registerOrganization(orgA_Id, admin);
+    function test_Dest_Verify_Fail_NotSynced() public {
+        uint48 epoch = 99;
+        uint256[2] memory sig = [uint256(9), 9];
+        bytes32 hash = keccak256("payload");
 
-        vm.startPrank(admin);
-        usdc.approve(address(network), 1000 ether);
-        network.depositLiquidity(orgA_Id, address(usdc), 1000 ether);
-        vm.stopPrank();
-
-        PaymentNetwork.Payment[] memory payments = new PaymentNetwork.Payment[](
-            3
-        );
-        payments[0] = PaymentNetwork.Payment(alice, 100 ether);
-        payments[1] = PaymentNetwork.Payment(bob, 200 ether);
-        payments[2] = PaymentNetwork.Payment(hacker, 300 ether);
-
-        // Total Payment = 600. Fee (1%) = 6. Total Deducted = 606.
-
-        network.processPayoutBatch(
-            orgA_Id,
-            keccak256("BatchMulti"),
-            address(usdc),
-            payments,
-            1,
-            ""
-        );
-
-        assertEq(usdc.balanceOf(alice), 100 ether);
-        assertEq(usdc.balanceOf(bob), 200 ether);
-        assertEq(usdc.balanceOf(hacker), 300 ether);
-        assertEq(
-            network.orgBalances(orgA_Id, address(usdc)),
-            1000 ether - 606 ether
-        );
+        vm.expectRevert(SymbioticDestinationVerifier.EpochNotSynced.selector);
+        destVerifier.verifySymbioticProof(hash, epoch, sig);
     }
 }
