@@ -6,10 +6,13 @@
 	url = https://github.com/openZeppelin/openzeppelin-contracts
 [submodule "contracts/lib/core"]
 	path = contracts/lib/core
-	url = https://github.com/symbioticfi/core
+	url = https://github.com/hyperlane-xyz/core
 [submodule "contracts/lib/relay-contracts"]
 	path = contracts/lib/relay-contracts
 	url = https://github.com/symbioticfi/relay-contracts
 [submodule "contracts/lib/rewards"]
 	path = contracts/lib/rewards
 	url = https://github.com/symbioticfi/rewards
+[submodule "contracts/lib/hyperlane-monorepo"]
+	path = contracts/lib/hyperlane-monorepo
+	url = https://github.com/hyperlane-xyz/hyperlane-monorepo
