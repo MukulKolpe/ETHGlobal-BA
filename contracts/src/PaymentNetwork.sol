@@ -8,6 +8,7 @@ import {
     SafeERC20
 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {TypeCasts} from "@hyperlane-xyz/libs/TypeCasts.sol";
 
 import {
     IBaseDelegator
@@ -57,13 +58,30 @@ import {
     Subnetwork
 } from "@symbioticfi/core/src/contracts/libraries/Subnetwork.sol";
 
+interface ITokenRouter {
+    function transferRemote(
+        uint32 _destination,
+        bytes32 _recipient,
+        uint256 _amountOrId
+    ) external payable returns (bytes32 messageId);
+}
+
+interface IMailbox {
+    function dispatch(
+        uint32 _destinationDomain,
+        bytes32 _recipientAddress,
+        bytes calldata _messageBody
+    ) external payable returns (bytes32);
+}
+
 /**
  * @title PaymentNetwork
- * @dev Handles liquidity management, organization registration, and signature verification via Symbiotic Relay.
+ * @notice Handles liquidity management, organization registration, Orchestrates multi-chain multi-token payments secured by Symbiotic Relay.
  */
 contract PaymentNetwork is NetworkManager, Ownable {
     using SafeERC20 for IERC20;
     using Subnetwork for bytes32;
+    using TypeCasts for address;
 
     // --- Errors ---
     error NotOrgAdmin();
@@ -80,6 +98,8 @@ contract PaymentNetwork is NetworkManager, Ownable {
     error FeeTransferFailed();
     error InvalidKeyTag();
     error NoSlashedFundsToRescue();
+    error RouteNotConfigured();
+    error InsufficientBridgeFee();
 
     // --- Events ---
     event OrganizationRegistered(
@@ -106,6 +126,17 @@ contract PaymentNetwork is NetworkManager, Ownable {
     );
     event TokenWhitelistUpdated(address indexed token, bool isAllowed);
     event SlashedFundsRescued(address indexed token, uint256 amount);
+    event WarpRouteSet(
+        address indexed token,
+        uint32 indexed destination,
+        address route
+    );
+    event CrossChainPayoutDispatched(
+        uint32 indexed destination,
+        address indexed token,
+        address recipient,
+        uint256 amount
+    );
 
     // --- Structs ---
     struct Organization {
@@ -116,8 +147,10 @@ contract PaymentNetwork is NetworkManager, Ownable {
     }
 
     struct Payment {
+        uint32 destinationDomain; // 0 for Local, >0 for Destination Chain ID
         address recipient;
         uint256 amount;
+        uint256 bridgeFee; // Native Token required for Hyperlane Gas
     }
 
     struct InitParams {
@@ -128,7 +161,8 @@ contract PaymentNetwork is NetworkManager, Ownable {
         uint32 messageExpiry;
         uint256 protocolFeeBps;
         address owner;
-        uint256 expectedKeyTag; // Expected Symbiotic Key Tag (15 for BLS)
+        uint256 expectedKeyTag;
+        address mailbox;
     }
 
     // --- Constants ---
@@ -138,17 +172,16 @@ contract PaymentNetwork is NetworkManager, Ownable {
         );
     address public constant ETH_ADDRESS = address(0);
 
-    // --- Immutables ---
     address public immutable VAULT_CONFIGURATOR;
     address public immutable DEFAULT_STAKER_REWARDS_FACTORY;
     address public immutable OPERATOR_VAULT_OPT_IN_SERVICE;
     address public immutable OPERATOR_NETWORK_OPT_IN_SERVICE;
     address public immutable OPERATOR_REGISTRY;
 
-    // --- State ---
     address public votingPowers;
     address public settlement;
     address public defaultCollateral;
+    address public mailbox;
     uint48 public vaultEpochDuration;
     uint32 public messageExpiry;
     uint256 public protocolFeeBps;
@@ -156,12 +189,15 @@ contract PaymentNetwork is NetworkManager, Ownable {
 
     mapping(bytes32 => Organization) public organizations;
     mapping(bytes32 => mapping(address => uint256)) public orgBalances;
-
-    // Tracks legitimate deposits.
     mapping(address => uint256) public totalRecordedLiquidity;
-
     mapping(bytes32 => bool) public processedBatches;
     mapping(address => bool) public allowedTokens;
+
+    // Token -> Destination chain Id -> Warp Route Address
+    mapping(address => mapping(uint32 => address)) public warpRoutes;
+
+    // Destination Verification: Chain ID -> Verifier Address on Dest Chain
+    mapping(uint32 => bytes32) public destinationVerifiers;
 
     constructor(
         address vaultConfigurator,
@@ -185,17 +221,16 @@ contract PaymentNetwork is NetworkManager, Ownable {
         messageExpiry = initParams.messageExpiry;
         protocolFeeBps = initParams.protocolFeeBps;
         expectedKeyTag = initParams.expectedKeyTag;
+        mailbox = initParams.mailbox;
 
         _transferOwnership(initParams.owner);
 
-        // Default Whitelist setup
         allowedTokens[ETH_ADDRESS] = true;
         if (defaultCollateral != address(0)) {
             allowedTokens[defaultCollateral] = true;
         }
         emit TokenWhitelistUpdated(ETH_ADDRESS, true);
 
-        // Initialize Network Manager
         __NetworkManager_init(
             INetworkManager.NetworkManagerInitParams({
                 network: INetworkManager(votingPowers).NETWORK(),
@@ -208,15 +243,37 @@ contract PaymentNetwork is NetworkManager, Ownable {
         IOptInService(OPERATOR_NETWORK_OPT_IN_SERVICE).optIn(NETWORK());
     }
 
-    /**
-     * @notice Registers a new Organization and automatically deploys a dedicated Vault.
-     * @param orgId Unique ID for the organization.
-     * @param admin The administrator address for this organization.
-     */
+    function setWarpRoute(
+        address token,
+        uint32 destination,
+        address route
+    ) external onlyOwner {
+        warpRoutes[token][destination] = route;
+        emit WarpRouteSet(token, destination, route);
+    }
+
+    function setTokenWhitelist(
+        address token,
+        bool isAllowed
+    ) external onlyOwner {
+        allowedTokens[token] = isAllowed;
+        emit TokenWhitelistUpdated(token, isAllowed);
+    }
+
+    function setDestinationVerifier(
+        uint32 domain,
+        bytes32 verifier
+    ) external onlyOwner {
+        destinationVerifiers[domain] = verifier;
+    }
+
+    // ==========================================
+    //  Organization & Liquidity
+    // ==========================================
+
     function registerOrganization(bytes32 orgId, address admin) external {
         if (organizations[orgId].exists) revert OrgAlreadyExists();
 
-        // Deploy unique Vault for this Organization
         (address vault, , ) = IVaultConfigurator(VAULT_CONFIGURATOR).create(
             IVaultConfigurator.InitParams({
                 version: 1,
@@ -287,21 +344,6 @@ contract PaymentNetwork is NetworkManager, Ownable {
         emit OrganizationRegistered(orgId, admin, vault, rewards);
     }
 
-    /**
-     * @notice Admin function to allow/ban specific tokens.
-     */
-    function setTokenWhitelist(
-        address token,
-        bool isAllowed
-    ) external onlyOwner {
-        allowedTokens[token] = isAllowed;
-        emit TokenWhitelistUpdated(token, isAllowed);
-    }
-
-    // ==========================================
-    //  Liquidity Accounting
-    // ==========================================
-
     function depositETH(bytes32 orgId) external payable {
         if (!organizations[orgId].exists) revert OrgDoesNotExist();
         if (!allowedTokens[ETH_ADDRESS]) revert TokenNotAllowed();
@@ -309,7 +351,6 @@ contract PaymentNetwork is NetworkManager, Ownable {
 
         orgBalances[orgId][ETH_ADDRESS] += msg.value;
         totalRecordedLiquidity[ETH_ADDRESS] += msg.value;
-
         emit LiquidityDeposited(orgId, ETH_ADDRESS, msg.value);
     }
 
@@ -374,9 +415,6 @@ contract PaymentNetwork is NetworkManager, Ownable {
         emit LiquidityWithdrawn(orgId, token, amount);
     }
 
-    /**
-     * @notice Rescue funds slashed from operators.
-     */
     function rescueSlashedFunds(address token, address to) external onlyOwner {
         uint256 currentBalance;
         if (token == ETH_ADDRESS) {
@@ -386,7 +424,6 @@ contract PaymentNetwork is NetworkManager, Ownable {
         }
 
         uint256 legitLiquidity = totalRecordedLiquidity[token];
-
         if (currentBalance <= legitLiquidity) revert NoSlashedFundsToRescue();
 
         uint256 surplus = currentBalance - legitLiquidity;
@@ -401,13 +438,31 @@ contract PaymentNetwork is NetworkManager, Ownable {
         emit SlashedFundsRescued(token, surplus);
     }
 
+    /**
+     * @notice Pushes current Validator Keys to destination chains for trust-minimized verification.
+     */
+    function syncValidatorSet(
+        uint32 destinationDomain,
+        uint256[4] calldata currentAggregateKey
+    ) external payable {
+        uint48 epoch = ISettlement(settlement).getLastCommittedHeaderEpoch();
+
+        bytes memory message = abi.encode(epoch, currentAggregateKey);
+
+        bytes32 recipient = destinationVerifiers[destinationDomain];
+        require(recipient != bytes32(0), "Verifier not set");
+
+        IMailbox(mailbox).dispatch{value: msg.value}(
+            destinationDomain,
+            recipient,
+            message
+        );
+    }
+
     // ==========================================
     //  Execution
     // ==========================================
 
-    /**
-     * @notice Processes a payout batch after verifying Symbiotic signatures.
-     */
     function processPayoutBatch(
         bytes32 orgId,
         bytes32 batchId,
@@ -415,13 +470,12 @@ contract PaymentNetwork is NetworkManager, Ownable {
         Payment[] calldata payments,
         uint48 epoch,
         bytes calldata proof
-    ) external {
+    ) external payable {
         if (processedBatches[batchId]) revert BatchAlreadyProcessed();
         Organization storage org = organizations[orgId];
         if (!org.exists) revert OrgDoesNotExist();
         if (!allowedTokens[token]) revert TokenNotAllowed();
 
-        // Verify Signature
         _verifyOrgSignature(orgId, batchId, token, payments, epoch, proof);
 
         uint256 totalPayment = 0;
@@ -432,10 +486,8 @@ contract PaymentNetwork is NetworkManager, Ownable {
         uint256 feeAmount = (totalPayment * protocolFeeBps) / 10000;
         uint256 totalDeduction = totalPayment + feeAmount;
 
-        // Check Internal Ledger
         if (orgBalances[orgId][token] < totalDeduction)
             revert InsufficientOrgLiquidity();
-
         orgBalances[orgId][token] -= totalDeduction;
         totalRecordedLiquidity[token] -= totalDeduction;
 
@@ -454,20 +506,45 @@ contract PaymentNetwork is NetworkManager, Ownable {
             if (!success) revert FeeTransferFailed();
         }
 
-        // Perform User Payouts
-        if (token == ETH_ADDRESS) {
-            for (uint256 i = 0; i < payments.length; i++) {
-                (bool success, ) = payments[i].recipient.call{
-                    value: payments[i].amount
-                }("");
-                if (!success) revert ETHTransferFailed();
-            }
-        } else {
-            for (uint256 i = 0; i < payments.length; i++) {
-                IERC20(token).safeTransfer(
-                    payments[i].recipient,
-                    payments[i].amount
-                );
+        uint256 totalNativeFeeUsed = 0;
+
+        for (uint256 i = 0; i < payments.length; i++) {
+            Payment memory p = payments[i];
+
+            if (p.destinationDomain == 0) {
+                // LOCAL
+                if (token == ETH_ADDRESS) {
+                    (bool success, ) = p.recipient.call{value: p.amount}("");
+                    if (!success) revert ETHTransferFailed();
+                } else {
+                    IERC20(token).safeTransfer(p.recipient, p.amount);
+                }
+            } else {
+                // CROSS-CHAIN
+                if (token == ETH_ADDRESS) {
+                    revert("Native ETH bridging not yet supported");
+                } else {
+                    address route = warpRoutes[token][p.destinationDomain];
+                    if (route == address(0)) revert RouteNotConfigured();
+                    if (msg.value < totalNativeFeeUsed + p.bridgeFee)
+                        revert InsufficientBridgeFee();
+
+                    IERC20(token).forceApprove(route, p.amount);
+
+                    ITokenRouter(route).transferRemote{value: p.bridgeFee}(
+                        p.destinationDomain,
+                        p.recipient.addressToBytes32(),
+                        p.amount
+                    );
+
+                    totalNativeFeeUsed += p.bridgeFee;
+                    emit CrossChainPayoutDispatched(
+                        p.destinationDomain,
+                        token,
+                        p.recipient,
+                        p.amount
+                    );
+                }
             }
         }
 
@@ -482,16 +559,13 @@ contract PaymentNetwork is NetworkManager, Ownable {
         uint48 epoch,
         bytes calldata proof
     ) internal view {
-        // Enforce Key Tag
         uint8 tag = ISettlement(settlement).getRequiredKeyTagFromValSetHeaderAt(
             epoch
         );
-
         if (tag != uint8(expectedKeyTag)) {
             revert InvalidKeyTag();
         }
 
-        // Construct Payload
         bytes memory payload = abi.encode(
             keccak256(
                 abi.encode(BATCH_TYPEHASH, orgId, batchId, token, payments)
@@ -507,7 +581,6 @@ contract PaymentNetwork is NetworkManager, Ownable {
             revert InvalidEpoch();
         }
 
-        // Verify Quorum via Symbiotic Settlement
         bool valid = ISettlement(settlement).verifyQuorumSigAt(
             payload,
             ISettlement(settlement).getRequiredKeyTagFromValSetHeaderAt(epoch),

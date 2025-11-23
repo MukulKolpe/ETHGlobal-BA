@@ -23,3 +23,4 @@ openzeppelin/=lib/relay-contracts/lib/network/lib/createx/lib/openzeppelin-contr
 relay-contracts/=lib/relay-contracts/
 rewards/=lib/rewards/src/
 solady/=lib/relay-contracts/lib/network/lib/createx/lib/solady/
+@hyperlane-xyz/=lib/hyperlane-monorepo/solidity/contracts/
