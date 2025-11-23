@@ -41,7 +41,8 @@ import {
 
 /**
  * @title VotingPowers
- * @notice Symbiotic Middleware for the Payment Network.
+ * @notice Symbiotic Middleware.
+ * @dev Manages Validator Sets, Stake, Rewards, and Slashing.
  */
 contract VotingPowers is
     VotingPowerProvider,
@@ -64,10 +65,6 @@ contract VotingPowers is
         OpNetVaultAutoDeploy(vaultConfigurator)
     {}
 
-    /**
-     * @notice Initializes the middleware and its sub-modules.
-     * @dev Calls initializers for VotingPower, AutoDeploy, Ownable, VPCalc, Rewards, Slashing, etc.
-     */
     function initialize(
         IVotingPowerProvider.VotingPowerProviderInitParams memory vpInitParams,
         IOpNetVaultAutoDeploy.OpNetVaultAutoDeployInitParams memory opNetInitParams,
@@ -96,17 +93,15 @@ contract VotingPowers is
         super._unregisterOperatorVaultImpl(operator, vault);
     }
 
-    // --- Middleware Logic ---
-
     /**
-     * @notice Sets the network limit hook for a specific vault.
+     * @notice Connects a Vault to the Symbiotic Network to enable Voting Power.
+     * @dev Called when a new Organization is registered.
      */
     function setMaxNetworkLimit(address vault) public {
         if (paymentNetwork != msg.sender && msg.sender != address(this)) {
             revert NotPaymentNetwork();
         }
 
-        // Interact with the Symbiotic Network contract to set the limit to Max.
         ISetMaxNetworkLimitHook(NETWORK()).setMaxNetworkLimit(
             IVault(vault).delegator(),
             SUBNETWORK_IDENTIFIER(),
